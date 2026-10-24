@@ -53,3 +53,57 @@ QUnit.test("extractAuthor - fallback to unknown", function (assert) {
     let author = parser.extractAuthor(dom);
     assert.equal(author, "<unknown>");
 });
+
+QUnit.test("parseNovelUrl - toc, chapter and serie urls", function(assert) {
+    assert.deepEqual(WtrlabParser.parseNovelUrl("https://wtr-lab.com/en/novel/86878/some-slug?tab=toc"),
+        {language: "en", id: "86878", slug: "some-slug", chapter: null});
+    assert.deepEqual(WtrlabParser.parseNovelUrl("https://wtr-lab.com/en/novel/86878/some-slug/chapter-12"),
+        {language: "en", id: "86878", slug: "some-slug", chapter: "12"});
+    assert.deepEqual(WtrlabParser.parseNovelUrl("https://wtr-lab.com/es/serie-123/abc/chapter-7"),
+        {language: "es", id: "123", slug: "abc", chapter: "7"});
+    assert.equal(WtrlabParser.parseNovelUrl("https://wtr-lab.com/en/novel-list"), null);
+});
+
+QUnit.test("resolveTokens - debranded text is decoded", function(assert) {
+    assert.equal(WtrlabParser.resolveTokens("My %{Novel|Tm92ZWw=} title"), "My Novel title");
+    assert.equal(WtrlabParser.resolveTokens("A %{\"safe\":\"U2VjcmV0\"} B"), "A Secret B");
+    assert.equal(WtrlabParser.resolveTokens("fallback %{safe|!!!}"), "fallback %{safe|!!!}");
+    assert.equal(WtrlabParser.resolveTokens("plain text"), "plain text");
+    assert.equal(WtrlabParser.resolveTokens(null), "");
+});
+
+QUnit.test("replaceTextWithCustomTerms - glossary placeholders and priorities", function(assert) {
+    let parser = new WtrlabParser();
+    parser.termsstory = [{from: "林枫", to: "Lin Feng"}];
+    parser.termsuser = [];
+    let data = {glossary_data: {terms: [["Lyn", "林枫"], [["Sword"], "剑"]]}};
+    assert.equal(parser.replaceTextWithCustomTerms(data, "※0⛬ draws the ※1〓."), "Lin Feng draws the Sword.");
+    parser.termsuser = [{from: "林枫", to: "Feng"}];
+    assert.equal(parser.replaceTextWithCustomTerms(data, "※0⛬ and ※9⛬"), "Feng and ※9⛬");
+});
+
+QUnit.test("isCustomError - inline body or content_url are valid", function(assert) {
+    let parser = new WtrlabParser();
+    assert.notOk(parser.isCustomError({json: {content_url: "/api/x"}}));
+    assert.notOk(parser.isCustomError({json: {data: {data: {body: ["a"]}}}}));
+    assert.ok(parser.isCustomError({json: {}}));
+    assert.ok(parser.isCustomError({json: {code: "CHAPTER_LOCKED"}}));
+    assert.ok(parser.isCustomError({json: {requireTurnstile: true, content_url: "/x"}}));
+});
+
+QUnit.test("buildChapter - text, inline images and leftover images", function(assert) {
+    let parser = new WtrlabParser();
+    let json = {data: {data: {
+        title: "The Start",
+        body: ["Hello %{World|V29ybGQ=}", "[image]", "end"],
+        images: ["//img.wtr-lab.com/a.png", "/b.png"]
+    }}};
+    let dom = parser.buildChapter(json, "https://wtr-lab.com/en/novel/1/slug/chapter-3");
+    let content = Parser.findConstructedContent(dom);
+    let paragraphs = [...content.querySelectorAll("p")].map(p => p.textContent);
+    assert.ok(content.querySelector("h1").textContent.endsWith("The Start"));
+    assert.equal(paragraphs[0], "Hello World");
+    assert.equal(paragraphs[2], "end");
+    let images = [...content.querySelectorAll("img")].map(i => i.getAttribute("src"));
+    assert.deepEqual(images, ["https://img.wtr-lab.com/a.png", "https://wtr-lab.com/b.png"]);
+});
