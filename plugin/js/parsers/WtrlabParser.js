@@ -29,6 +29,12 @@ class WtrlabParser extends Parser {
         this.slug = slug;
         let chapters = (await HttpClient.fetchJson("https://wtr-lab.com/api/chapters/" + id)).json;
         let serie_id = chapters.chapters[0].serie_id;
+        this.chapterIds = {};
+        for (let c of chapters.chapters) {
+            if (c?.id != null) {
+                this.chapterIds[String(c.order)] = c.id;
+            }
+        }
         try {
             let terms = (await HttpClient.fetchJson("https://wtr-lab.com/api/v2/user/config")).json;
             terms = terms?.config?.terms.filter(a => (a[4] == null) || (a[4].includes(serie_id)));
@@ -145,6 +151,10 @@ class WtrlabParser extends Parser {
                 "retry":false,
                 "force_retry":false
             };
+        let chapterId = this.chapterIds?.[String(chapter)];
+        if (chapterId != null) {
+            formData.chapter_id = chapterId;
+        }
         let header = {"Content-Type": "application/json;charset=UTF-8"};
         let options = {
             method: "POST",
@@ -153,15 +163,110 @@ class WtrlabParser extends Parser {
             parser: this
         };
         let json = (await HttpClient.fetchJson(fetchUrl, options)).json;
-        let contentjson = (await HttpClient.fetchJson("https://wtr-lab.com"+json.content_url)).json;
+        let contentjson = json;
+        if (!WtrlabParser.findBodyContainer(json) && json?.content_url) {
+            let contentUrl = json.content_url;
+            if (contentUrl.startsWith("//")) {
+                contentUrl = "https:" + contentUrl;
+            } else if (contentUrl.startsWith("/")) {
+                contentUrl = "https://wtr-lab.com" + contentUrl;
+            }
+            let text = (await HttpClient.fetchText(contentUrl));
+            contentjson = WtrlabParser.parseContentResponse(text, json);
+        }
+        await this.decryptBody(contentjson);
         return this.buildChapter(contentjson, url);
+    }
+
+    // Content endpoint may return JSON (in several layouts), or the raw
+    // encrypted body string ("arr:..." / "str:...") on its own.
+    static parseContentResponse(text, readerJson) {
+        text = (text ?? "").trim();
+        let parsed = null;
+        try {
+            parsed = JSON.parse(text);
+        } catch (e) {
+            parsed = text;
+        }
+        if (typeof parsed === "string" || Array.isArray(parsed)) {
+            let data = readerJson?.data?.data ?? {};
+            return { data: { data: { ...data, body: parsed } } };
+        }
+        let container = WtrlabParser.findBodyContainer(parsed);
+        if (container && container !== parsed?.data?.data) {
+            return { data: { data: container } };
+        }
+        return parsed;
+    }
+
+    static findBodyContainer(json) {
+        let usable = (v) => (Array.isArray(v) || typeof v === "string") && v.length > 0;
+        let walk = (obj, depth) => {
+            if (obj == null || typeof obj !== "object" || depth > 6) {
+                return null;
+            }
+            if (!Array.isArray(obj) && usable(obj.body)) {
+                return obj;
+            }
+            let values = Array.isArray(obj) ? obj.slice(0, 10) : Object.values(obj);
+            for (let v of values) {
+                let found = walk(v, depth + 1);
+                if (found) {
+                    return found;
+                }
+            }
+            return null;
+        };
+        if (usable(json?.data?.data?.body)) {
+            return json.data.data;
+        }
+        return walk(json, 0);
+    }
+
+    async decryptBody(json) {
+        let data = json?.data?.data;
+        if (data == null || typeof data.body !== "string") {
+            return;
+        }
+        data.body = await WtrlabParser.decryptText(data.body);
+    }
+
+    // Body format: "arr:<iv b64>:<tag b64>:<ciphertext b64>" (AES-GCM, JSON array)
+    // or "str:..." (plain string)
+    static async decryptText(encrypted) {
+        let isArray = encrypted.startsWith("arr:");
+        if (!isArray && !encrypted.startsWith("str:")) {
+            return [encrypted];
+        }
+        let parts = encrypted.substring(4).split(":");
+        if (parts.length != 3) {
+            throw new Error("WTR-LAB: invalid encrypted chapter body format");
+        }
+        let b64ToBytes = (b64) => Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+        let iv = b64ToBytes(parts[0]);
+        let tag = b64ToBytes(parts[1]);
+        let cipher = b64ToBytes(parts[2]);
+        let combined = new Uint8Array(cipher.length + tag.length);
+        combined.set(cipher, 0);
+        combined.set(tag, cipher.length);
+        let key = await crypto.subtle.importKey(
+            "raw",
+            new TextEncoder().encode(WtrlabParser.AES_KEY),
+            { name: "AES-GCM" },
+            false,
+            ["decrypt"]
+        );
+        let plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: iv }, key, combined);
+        let text = new TextDecoder("utf-8").decode(plain);
+        let decoded = isArray ? JSON.parse(text) : text;
+        return Array.isArray(decoded) ? decoded.map(a => String(a)) : [String(decoded)];
     }
     
     isCustomError(response) {
         if (response.json?.code == "CHAPTER_LOCKED") {
             return true;
         }
-        if (response.json?.content_url?false:true) {
+        if (!response.json?.content_url && !WtrlabParser.findBodyContainer(response.json)) {
             return true;
         }
         if (response.json.requireTurnstile) {
@@ -181,7 +286,7 @@ class WtrlabParser extends Parser {
             newresp.errorMessage = "Fetch of URL '"+newresp.response.url+"' failed.\nThe Chapter isn't Ai translated.";
             return newresp;
         }
-        if (checkedresponse.json.requireTurnstile || checkedresponse.json.code == 1401) {
+        if (checkedresponse.json?.requireTurnstile || checkedresponse.json?.code == 1401) {
             let newresp = {};
             newresp.url = url;
             newresp.wrapOptions = wrapOptions;
@@ -224,7 +329,11 @@ class WtrlabParser extends Parser {
         newDoc.content.appendChild(title);
         let br = newDoc.dom.createElement("br");
         let imagecounter = 0;
-        for (let element of json.data.data.body) {
+        let body = json.data.data.body;
+        if (typeof body === "string") {
+            body = [body];
+        }
+        for (let element of body) {
             if (element == "[image]") {
                 let imgnode = newDoc.dom.createElement("img");
                 let imghref = json.data.data?.images?.[imagecounter++]??"";
@@ -281,3 +390,5 @@ class WtrlabParser extends Parser {
     }
 
 }
+
+WtrlabParser.AES_KEY = "IJAFUUxjM25hyzL2AZrn0wl7cESED6Ru";
